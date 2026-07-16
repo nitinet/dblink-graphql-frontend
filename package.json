@@ -1,0 +1,38 @@
+{
+  "name": "dblink-graphql-frontend",
+  "version": "1.0.0",
+  "description": "GraphQL execution layer for dblink — auto-generates schema from QuerySet metadata and supports introspection.",
+  "license": "ISC",
+  "author": "",
+  "type": "module",
+  "main": "src/index.js",
+  "types": "src/index.ts",
+  "scripts": {
+    "test": "vitest run",
+    "tsc": "tsc",
+    "eslint": "eslint --fix ./src/**/*.ts",
+    "prettier": "prettier --log-level silent --write ./src",
+    "build": "run-s tsc eslint prettier"
+  },
+  "dependencies": {
+    "dblink": "^1.4.6",
+    "graphql": "^16.14.0",
+    "reflect-metadata": "^0.2.2",
+    "lodash-es": "^4.18.1"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.28.0",
+    "@types/lodash-es": "^4.17.12",
+    "@types/node": "^25.9.1",
+    "@types/pg": "^8.20.0",
+    "dblink-pg": "^1.4.0",
+    "tsx": "^4.22.3",
+    "eslint-config-prettier": "^10.1.5",
+    "eslint-plugin-prettier": "^5.4.1",
+    "globals": "^16.2.0",
+    "npm-run-all": "^4.1.5",
+    "ts-node": "^10.9.2",
+    "typescript-eslint": "^8.33.1",
+    "vitest": "^4.1.7"
+  }
+}

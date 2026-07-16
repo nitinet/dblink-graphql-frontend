@@ -1,0 +1,18 @@
+{
+  "compilerOptions": {
+    "module": "node20",
+    "target": "es2022",
+    "moduleResolution": "node16",
+    "inlineSourceMap": true,
+    "allowSyntheticDefaultImports": true,
+    "removeComments": true,
+    "incremental": true,
+    "experimentalDecorators": true,
+    "emitDecoratorMetadata": true,
+    "strict": true,
+    "outDir": "./",
+    "types": ["node"]
+  },
+  "include": ["./**/*"],
+  "exclude": ["node_modules"]
+}

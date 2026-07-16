@@ -1,0 +1,25 @@
+import { execute, parse, validate } from 'graphql';
+import { buildSchemaFromQuerySet } from './schemaBuilder.js';
+export class QuerySetGraphQLHandler {
+  schema;
+  constructor(queryset, name) {
+    this.schema = buildSchemaFromQuerySet(queryset, name);
+  }
+  getSchema() {
+    return this.schema;
+  }
+  async execute(source, variables, operationName) {
+    const document = typeof source === 'string' ? parse(source) : source;
+    const errors = validate(this.schema, document);
+    if (errors.length > 0) {
+      return { errors };
+    }
+    return execute({
+      schema: this.schema,
+      document,
+      variableValues: variables,
+      operationName
+    });
+  }
+}
+//# sourceMappingURL=data:application/json;base64,eyJ2ZXJzaW9uIjozLCJmaWxlIjoiUXVlcnlTZXRIYW5kbGVyLmpzIiwic291cmNlUm9vdCI6IiIsInNvdXJjZXMiOlsiUXVlcnlTZXRIYW5kbGVyLnRzIl0sIm5hbWVzIjpbXSwibWFwcGluZ3MiOiJBQUNBLE9BQU8sRUFBZ0QsT0FBTyxFQUFFLEtBQUssRUFBRSxRQUFRLEVBQUUsTUFBTSxTQUFTLENBQUM7QUFDakcsT0FBTyxFQUFFLHVCQUF1QixFQUFFLE1BQU0sb0JBQW9CLENBQUM7QUFxQzdELE1BQU0sT0FBTyxzQkFBc0I7SUFDaEIsTUFBTSxDQUFnQjtJQUV2QyxZQUFZLFFBQWlDLEVBQUUsSUFBWTtRQUN6RCxJQUFJLENBQUMsTUFBTSxHQUFHLHVCQUF1QixDQUFDLFFBQVEsRUFBRSxJQUFJLENBQUMsQ0FBQztJQUN4RCxDQUFDO0lBUUQsU0FBUztRQUNQLE9BQU8sSUFBSSxDQUFDLE1BQU0sQ0FBQztJQUNyQixDQUFDO0lBU0QsS0FBSyxDQUFDLE9BQU8sQ0FBQyxNQUE2QixFQUFFLFNBQW1DLEVBQUUsYUFBc0I7UUFDdEcsTUFBTSxRQUFRLEdBQWlCLE9BQU8sTUFBTSxLQUFLLFFBQVEsQ0FBQyxDQUFDLENBQUMsS0FBSyxDQUFDLE1BQU0sQ0FBQyxDQUFDLENBQUMsQ0FBQyxNQUFNLENBQUM7UUFFbkYsTUFBTSxNQUFNLEdBQUcsUUFBUSxDQUFDLElBQUksQ0FBQyxNQUFNLEVBQUUsUUFBUSxDQUFDLENBQUM7UUFDL0MsSUFBSSxNQUFNLENBQUMsTUFBTSxHQUFHLENBQUMsRUFBRSxDQUFDO1lBQ3RCLE9BQU8sRUFBRSxNQUFNLEVBQUUsQ0FBQztRQUNwQixDQUFDO1FBRUQsT0FBTyxPQUFPLENBQUM7WUFDYixNQUFNLEVBQUUsSUFBSSxDQUFDLE1BQU07WUFDbkIsUUFBUTtZQUNSLGNBQWMsRUFBRSxTQUFTO1lBQ3pCLGFBQWE7U0FDZCxDQUFDLENBQUM7SUFDTCxDQUFDO0NBQ0YifQ==

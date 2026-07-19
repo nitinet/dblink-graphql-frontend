@@ -162,12 +162,12 @@ type UserOrder {
 **Left join:**
 
 ```typescript
-import { collection } from 'dblink';
+import { core } from 'dblink';
 
 const leftJoinQS = ctx.users.join(
   ctx.orders,
   (u, o) => u.eq('id', o.col('userId')),
-  collection.types.Join.LeftJoin   // optional, defaults to InnerJoin
+  core.sql.types.Join.LeftJoin   // optional, defaults to InnerJoin
 );
 const handler = new QuerySetGraphQLHandler(leftJoinQS, 'UserOrderLeft');
 ```

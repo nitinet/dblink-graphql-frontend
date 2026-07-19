@@ -1,6 +1,6 @@
 import 'reflect-metadata';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { Context, collection, decorators } from 'dblink';
+import { Context, collection, core, decorators } from 'dblink';
 import PostgreSql from 'dblink-pg';
 import { QuerySetGraphQLHandler } from '../src/index.js';
 
@@ -415,6 +415,94 @@ describe('QuerySetGraphQLHandler — JoinQuerySet (dblink-pg)', () => {
     const result = await handler.execute(`{ userOrders { name } }`);
     expect(result.errors).toBeUndefined();
     expect((result.data!.userOrders as unknown[]).length).toBe(3);
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// LeftJoin (users LEFT JOIN orders) — some users have no matching orders
+// ══════════════════════════════════════════════════════════════════════════
+
+describe('QuerySetGraphQLHandler — LeftJoin (dblink-pg)', () => {
+  let handler: QuerySetGraphQLHandler<User & Order>;
+
+  beforeAll(async () => {
+    if (!ctx) {
+      await pg.init();
+      await setupDb();
+      ctx = new AppContext(pg);
+      await ctx.init();
+    }
+    await setupOrdersDb();
+    // Carol has no orders — only a LEFT JOIN should surface her (with null order fields)
+    await pg.run(`INSERT INTO gql_test_users (name, email) VALUES ('Carol', 'carol@example.com')`);
+
+    const leftJoinQS = ctx.users.join(ctx.orders, (u, o) => u.eq('id', o.col('userId')), core.sql.types.Join.LeftJoin);
+    handler = new QuerySetGraphQLHandler(leftJoinQS, 'UserOrderLeft');
+  });
+
+  it('list — includes the user with no matching orders, with null order fields', async () => {
+    const result = await handler.execute(`{ userOrderLefts { name orderId amount } }`);
+    expect(result.errors).toBeUndefined();
+    const rows = result.data!.userOrderLefts as { name: string; orderId: string | null; amount: number | null }[];
+    // Alice (2 orders) + Bob (1 order) + Carol (0 orders, null-filled) = 4 rows
+    expect(rows).toHaveLength(4);
+    const carolRow = rows.find(r => r.name === 'Carol');
+    expect(carolRow).toBeDefined();
+    expect(carolRow!.orderId).toBeNull();
+    expect(carolRow!.amount).toBeNull();
+  });
+
+  it('count — includes the null-filled row for the unmatched user', async () => {
+    const result = await handler.execute(`{ userOrderLeftsCount }`);
+    expect(result.errors).toBeUndefined();
+    expect(result.data!.userOrderLeftsCount).toBe(4);
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// select() narrowing on a JoinQuerySet
+// ══════════════════════════════════════════════════════════════════════════
+
+describe('QuerySetGraphQLHandler — select()-narrowed JoinQuerySet (dblink-pg)', () => {
+  let handler: QuerySetGraphQLHandler<Pick<User & Order, 'name' | 'amount'>>;
+
+  beforeAll(async () => {
+    if (!ctx) {
+      await pg.init();
+      await setupDb();
+      ctx = new AppContext(pg);
+      await ctx.init();
+    }
+    await setupOrdersDb();
+
+    // Inner join (default), narrowed to only name + amount
+    const narrowedJoin = ctx.users.join(ctx.orders, (u, o) => u.eq('id', o.col('userId'))).select(['name', 'amount']);
+    handler = new QuerySetGraphQLHandler(narrowedJoin, 'UserOrderSummary');
+  });
+
+  it('introspection — only selected fields appear on the type', async () => {
+    const result = await handler.execute(`{ __type(name: "UserOrderSummary") { fields { name } } }`);
+    expect(result.errors).toBeUndefined();
+    const fields = (result.data!.__type as { fields: { name: string }[] }).fields.map(f => f.name);
+    expect(fields).toContain('name');
+    expect(fields).toContain('amount');
+    expect(fields).not.toContain('orderId');
+    expect(fields).not.toContain('userId');
+    expect(fields).not.toContain('id');
+    expect(fields).not.toContain('email');
+  });
+
+  it('list — returns only selected columns', async () => {
+    const result = await handler.execute(`{ userOrderSummarys { name amount } }`);
+    expect(result.errors).toBeUndefined();
+    // Carol has no orders, so the default InnerJoin excludes her: Alice (2) + Bob (1) = 3
+    const rows = result.data!.userOrderSummarys as { name: string; amount: number }[];
+    expect(rows).toHaveLength(3);
+  });
+
+  it('validation — querying a non-selected field is a GQL error', async () => {
+    const result = await handler.execute(`{ userOrderSummarys { orderId } }`);
+    expect(result.errors).toBeDefined();
   });
 });
 

@@ -1,3 +1,10 @@
+// A regular `import type` of the ambient .d.ts wouldn't be re-discovered by an external
+// consumer's tsc (this package's `types` field points at raw .ts source, so a consumer
+// only follows the `import` graph - sibling ambient .d.ts files outside that graph are
+// invisible to it). The triple-slash reference is the one mechanism TS honors regardless
+// of which project is doing the compiling.
+// eslint-disable-next-line @typescript-eslint/triple-slash-reference
+/// <reference path="./class-transformer-storage.d.ts" />
 import { defaultMetadataStorage } from 'class-transformer/cjs/storage.js';
 import { GraphQLBoolean, GraphQLFloat, GraphQLID, GraphQLScalarType, GraphQLString } from 'graphql';
 

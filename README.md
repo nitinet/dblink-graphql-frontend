@@ -2,7 +2,7 @@
 
 Auto-generates a GraphQL execution layer from [dblink](https://github.com/nitinjs/dblink) `TableSet`, `QuerySet`, and `JoinQuerySet` — no manual schema definition required.
 
-![Version](https://img.shields.io/badge/version-1.0.0-blue)
+![Version](https://img.shields.io/badge/version-1.0.2-blue)
 ![License](https://img.shields.io/badge/license-ISC-green)
 ![TypeScript](https://img.shields.io/badge/TypeScript-5.0%2B-blue)
 
@@ -192,7 +192,7 @@ For every queryset registered under name `Name`, the following types and query f
 | Generated | Description |
 |---|---|
 | `Name` | Object type with all exposed fields |
-| `NameFilter` | Input type mapping each field to its `{Scalar}Filter` operator input, plus a self-referential `or` field |
+| `NameFilter` | Input type mapping each field to its `{Scalar}Filter` operator input, plus self-referential `and`/`or` fields |
 | `FloatFilter` / `IntFilter` | `{ eq, neq, gt, gte, lt, lte, in, notIn, between, isNull }` — numeric fields |
 | `StringFilter` | `{ eq, neq, like, in, notIn, isNull }` — string fields (no ordering, no `between`) |
 | `BooleanFilter` / `IDFilter` | `{ eq, neq, in, notIn, isNull }` — no ordering, no `like`, no `between` |
@@ -229,11 +229,12 @@ operators on the same field are ANDed together:
 SQL builder method under the hood, but the GraphQL-facing operator works the same
 as a native one.
 
-**`or` — combining filters with OR:**
+**`and` / `or` — combining filters explicitly:**
 
-Every `{Name}Filter` also accepts an `or` field: an array of nested filter objects
-(same shape, recursively). A filter object's own direct fields AND together; its
-`or` branches OR together; the two results AND:
+Every `{Name}Filter` also accepts `and` and `or` fields: arrays of nested filter
+objects (same shape, recursively). A filter object's own direct fields AND
+together; its `and` branches AND in (redundant with just merging fields into
+one object, on its own); its `or` branches OR together; all three results AND:
 
 ```graphql
 # name = "Alice" OR name = "Bob"
@@ -245,11 +246,32 @@ Every `{Name}Filter` also accepts an `or` field: an array of nested filter objec
     or: [{ name: { eq: "Alice" } }, { name: { eq: "Bob" } }]
   }) { id name } }
 
-# or branches can nest arbitrarily
+# and/or branches can nest arbitrarily
 { users(filter: { or: [
     { name: { eq: "Alice" } },
     { or: [{ name: { eq: "Bob" } }, { name: { eq: "Carol" } }] }
   ] }) { id name } }
+
+# and is where it earns its keep: combining two independent or-groups that a
+# single filter object (only one `or` field) can't express directly.
+# (name = "Alice" OR name = "Bob") AND (status = "active" OR status = "pending")
+{ users(filter: { and: [
+    { or: [{ name: { eq: "Alice" } }, { name: { eq: "Bob" } }] },
+    { or: [{ status: { eq: "active" } }, { status: { eq: "pending" } }] }
+  ] }) { id name } }
+```
+
+**Typing `filter` on the consuming side:** the package exports a generic `Filter<T>`
+type mirroring the `{Name}Filter` shape above for any entity `T`, so callers that
+build/accept filter objects outside of a raw GraphQL query string (e.g. a REST
+endpoint that forwards its body straight into a `filter` variable) don't have to
+duplicate this shape by hand:
+
+```typescript
+import type { Filter } from 'dblink-graphql-frontend';
+import User from './entities/User.js';
+
+type UserFilter = Filter<User>; // same shape as the generated UserFilter GraphQL input type
 ```
 
 ## Introspection

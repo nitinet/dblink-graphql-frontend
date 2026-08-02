@@ -135,6 +135,32 @@ describe('applyArgs', () => {
     applyArgs(qs, { filter: { or: [{ secret: { eq: 'x' } }, { name: { eq: 'Alice' } }] } }, new Set(['name']));
     expect(qs.calls).toEqual([{ kind: 'where', method: 'eq', field: 'name', value: 'Alice' }]);
   });
+  it('ANDs branches of a top-level and array', () => {
+    const qs = makeFakeQuerySet();
+    applyArgs(qs, { filter: { and: [{ name: { eq: 'Alice' } }, { status: { eq: true } }] } }, new Set(['name', 'status']));
+    expect(qs.calls).toEqual([{ kind: 'where', method: 'eq', field: 'name', value: 'Alice' }, { kind: 'where', method: 'eq', field: 'status', value: true }, { kind: 'and' }]);
+  });
+  it('ANDs a direct field filter with an and array', () => {
+    const qs = makeFakeQuerySet();
+    applyArgs(qs, { filter: { email: { like: '%x%' }, and: [{ name: { eq: 'Alice' } }] } }, new Set(['name', 'email']));
+    expect(qs.calls).toEqual([{ kind: 'where', method: 'like', field: 'email', value: '%x%' }, { kind: 'where', method: 'eq', field: 'name', value: 'Alice' }, { kind: 'and' }]);
+  });
+  it('ANDs an and array together with an or array', () => {
+    const qs = makeFakeQuerySet();
+    applyArgs(qs, { filter: { and: [{ status: { eq: true } }], or: [{ name: { eq: 'Alice' } }, { name: { eq: 'Bob' } }] } }, new Set(['name', 'status']));
+    expect(qs.calls).toEqual([
+      { kind: 'where', method: 'eq', field: 'status', value: true },
+      { kind: 'where', method: 'eq', field: 'name', value: 'Alice' },
+      { kind: 'where', method: 'eq', field: 'name', value: 'Bob' },
+      { kind: 'or' },
+      { kind: 'and' }
+    ]);
+  });
+  it('an and branch that contributes nothing (all-unknown fields) is skipped', () => {
+    const qs = makeFakeQuerySet();
+    applyArgs(qs, { filter: { and: [{ secret: { eq: 'x' } }, { name: { eq: 'Alice' } }] } }, new Set(['name']));
+    expect(qs.calls).toEqual([{ kind: 'where', method: 'eq', field: 'name', value: 'Alice' }]);
+  });
   it('ignores filter fields not present in knownFields', () => {
     const qs = makeFakeQuerySet();
     applyArgs(qs, { filter: { secret: { eq: 'x' } } }, new Set(['name']));

@@ -179,6 +179,39 @@ describe('applyArgs', () => {
     expect(qs.calls).toEqual([{ kind: 'where', method: 'eq', field: 'name', value: 'Alice' }]);
   });
 
+  it('ANDs branches of a top-level and array', () => {
+    const qs = makeFakeQuerySet();
+    applyArgs(qs as never, { filter: { and: [{ name: { eq: 'Alice' } }, { status: { eq: true } }] } } as unknown as ListArgs, new Set(['name', 'status']));
+    expect(qs.calls).toEqual([{ kind: 'where', method: 'eq', field: 'name', value: 'Alice' }, { kind: 'where', method: 'eq', field: 'status', value: true }, { kind: 'and' }]);
+  });
+
+  it('ANDs a direct field filter with an and array', () => {
+    const qs = makeFakeQuerySet();
+    applyArgs(qs as never, { filter: { email: { like: '%x%' }, and: [{ name: { eq: 'Alice' } }] } } as unknown as ListArgs, new Set(['name', 'email']));
+    expect(qs.calls).toEqual([{ kind: 'where', method: 'like', field: 'email', value: '%x%' }, { kind: 'where', method: 'eq', field: 'name', value: 'Alice' }, { kind: 'and' }]);
+  });
+
+  // The main reason `and` exists as an explicit array (instead of just merging fields into one
+  // object, which already ANDs implicitly): it lets multiple independent `or` groups combine,
+  // e.g. (status = true) AND (name = 'Alice' OR name = 'Bob').
+  it('ANDs an and array together with an or array', () => {
+    const qs = makeFakeQuerySet();
+    applyArgs(qs as never, { filter: { and: [{ status: { eq: true } }], or: [{ name: { eq: 'Alice' } }, { name: { eq: 'Bob' } }] } } as unknown as ListArgs, new Set(['name', 'status']));
+    expect(qs.calls).toEqual([
+      { kind: 'where', method: 'eq', field: 'status', value: true },
+      { kind: 'where', method: 'eq', field: 'name', value: 'Alice' },
+      { kind: 'where', method: 'eq', field: 'name', value: 'Bob' },
+      { kind: 'or' },
+      { kind: 'and' }
+    ]);
+  });
+
+  it('an and branch that contributes nothing (all-unknown fields) is skipped', () => {
+    const qs = makeFakeQuerySet();
+    applyArgs(qs as never, { filter: { and: [{ secret: { eq: 'x' } }, { name: { eq: 'Alice' } }] } } as unknown as ListArgs, new Set(['name']));
+    expect(qs.calls).toEqual([{ kind: 'where', method: 'eq', field: 'name', value: 'Alice' }]);
+  });
+
   it('ignores filter fields not present in knownFields', () => {
     const qs = makeFakeQuerySet();
     applyArgs(qs as never, { filter: { secret: { eq: 'x' } } } as ListArgs, new Set(['name']));

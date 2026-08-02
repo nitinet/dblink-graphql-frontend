@@ -21,7 +21,7 @@ import { buildSchemaFromQuerySet } from './schemaBuilder.js';
  * const handler = new QuerySetGraphQLHandler(ctx.users, 'User');
  *
  * const result = await handler.execute(`
- *   { users(filter: { name: "Alice" }, limit: 10) { id name email } }
+ *   { users(filter: { name: { eq: "Alice" } }, limit: 10) { id name email } }
  * `);
  * ```
  *

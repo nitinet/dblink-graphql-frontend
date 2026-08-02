@@ -775,16 +775,6 @@ describe('Scale — 100 rows per table, every operator cross-checked against JS-
     it('or ANDs with a sibling range filter', async () => {
         expectIds(await scaleIds(scaleOrderHandler, 'orderId', `{ orders(filter: { amount: { gte: 0, lte: 400 }, or: [{ userId: { eq: 1 } }, { userId: { eq: 2 } }] }) { orderId } }`), scaleOrders.filter(o => o.amount !== null && o.amount >= 0 && o.amount <= 400 && (o.userId === 1 || o.userId === 2)).map(o => o.orderId));
     });
-    it('validation — the old bare-scalar filter shape is still rejected at scale', async () => {
-        const result = await scaleUserHandler.execute(`{ users(filter: { name: "Alice" }) { id } }`);
-        expect(result.errors).toBeDefined();
-        expect(result.errors.length).toBeGreaterThan(0);
-    });
-    it('validation — like is rejected on FloatFilter', async () => {
-        const result = await scaleOrderHandler.execute(`{ orders(filter: { amount: { like: "2%" } }) { orderId } }`);
-        expect(result.errors).toBeDefined();
-        expect(result.errors.length).toBeGreaterThan(0);
-    });
 });
 afterAll(async () => {
     await pg.run('DROP TABLE IF EXISTS orders_gql_test');

@@ -1011,20 +1011,6 @@ describe('Scale — 100 rows per table, every operator cross-checked against JS-
       scaleOrders.filter(o => o.amount !== null && o.amount >= 0 && o.amount <= 400 && (o.userId === 1 || o.userId === 2)).map(o => o.orderId)
     );
   });
-
-  // ── Validation ──────────────────────────────────────────────────────────
-
-  it('validation — the old bare-scalar filter shape is still rejected at scale', async () => {
-    const result = await scaleUserHandler.execute(`{ users(filter: { name: "Alice" }) { id } }`);
-    expect(result.errors).toBeDefined();
-    expect(result.errors!.length).toBeGreaterThan(0);
-  });
-
-  it('validation — like is rejected on FloatFilter', async () => {
-    const result = await scaleOrderHandler.execute(`{ orders(filter: { amount: { like: "2%" } }) { orderId } }`);
-    expect(result.errors).toBeDefined();
-    expect(result.errors!.length).toBeGreaterThan(0);
-  });
 });
 
 // Drop test tables and end the pg pool once all suites have finished

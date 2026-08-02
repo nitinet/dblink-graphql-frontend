@@ -18,7 +18,7 @@ import { buildSchema } from './schemaBuilder.js';
  *
  * const result = await handler.execute(`
  *   query {
- *     users(filter: { name: "Alice" }, limit: 10) {
+ *     users(filter: { name: { eq: "Alice" } }, limit: 10) {
  *       id
  *       name
  *       email
@@ -43,8 +43,9 @@ export class GraphQLHandler {
   }
 
   /**
-   * Parses, validates, and executes a GraphQL query / mutation / subscription
-   * string against the dblink context.
+   * Parses, validates, and executes a GraphQL query string against the
+   * dblink context. Only queries are supported — the generated schema has
+   * no mutation or subscription type.
    *
    * @param source       - GraphQL query string or pre-parsed `DocumentNode`
    * @param variables    - Optional variable map

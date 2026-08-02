@@ -204,15 +204,17 @@ function getFilterInputType(gqlType: GraphQLScalarType): GraphQLInputObjectType 
 
 /**
  * Recursively builds a single `Expression` tree from a `{Name}Filter`-shaped object:
- * every present field's operators AND together, and if an `or` array of nested
- * filter objects is present, its branches OR together and AND with the rest.
+ * every present field's operators AND together; an `and` array of nested filter objects
+ * ANDs its branches in (redundant with just merging fields into one object, but lets
+ * multiple independent `or` groups be combined explicitly, e.g. `(a OR b) AND (c OR d)`);
+ * an `or` array of nested filter objects ORs its branches and ANDs the result with the rest.
  * Returns `undefined` when the object contributes nothing (e.g. all-unknown fields).
  */
 function buildFilterExpression<T extends AnyRecord>(eb: exprBuilder.WhereExprBuilder<T>, filter: AnyRecord, knownFields: Set<string>): Expression | undefined {
   let combined: Expression | undefined;
 
   for (const [field, opValue] of Object.entries(filter)) {
-    if (field === 'or') continue;
+    if (field === 'and' || field === 'or') continue;
     if (opValue === undefined || opValue === null) continue;
     if (!knownFields.has(field)) continue;
     const f = field as keyof T;
@@ -220,6 +222,15 @@ function buildFilterExpression<T extends AnyRecord>(eb: exprBuilder.WhereExprBui
       if (value === undefined || value === null) continue;
       const expr = buildOperandExpression(eb, f, op as FilterOp, value);
       combined = combined ? combined.and(expr) : expr;
+    }
+  }
+
+  const andBranches = filter.and;
+  if (Array.isArray(andBranches) && andBranches.length > 0) {
+    for (const branch of andBranches as AnyRecord[]) {
+      const branchExpr = buildFilterExpression(eb, branch, knownFields);
+      if (!branchExpr) continue;
+      combined = combined ? combined.and(branchExpr) : branchExpr;
     }
   }
 
@@ -251,9 +262,10 @@ export interface ListArgs {
  * Only fields in `knownFields` are accepted — unknown keys are silently ignored.
  *
  * Each filter field's value is an operator object (e.g. `{ gte: 2, lte: 6 }`);
- * every operator present is ANDed together. An `or` array of nested filter
- * objects (same shape, recursive) ORs its branches and ANDs the result with
- * the rest of the filter.
+ * every operator present is ANDed together. An `and` array of nested filter
+ * objects (same shape, recursive) ANDs its branches in — redundant with plain
+ * fields unless combined with multiple independent `or` groups. An `or` array
+ * ORs its branches and ANDs the result with the rest of the filter.
  */
 export function applyArgs<T extends AnyRecord>(qs: collection.IQuerySet<T>, args: ListArgs, knownFields: Set<string>): collection.IQuerySet<T> {
   if (args.filter) {
@@ -348,12 +360,13 @@ export function buildSchemaFromQuerySet<T extends object>(queryset: collection.I
 
   const ObjectType = new GraphQLObjectType({ name, fields: objectTypeFields });
 
-  // `fields` is a thunk so the `or` field can reference FilterInput itself —
+  // `fields` is a thunk so the `and`/`or` fields can reference FilterInput itself —
   // GraphQL input types may be self-referential as long as the fields are lazy.
   const FilterInput: GraphQLInputObjectType = new GraphQLInputObjectType({
     name: `${name}Filter`,
     fields: () => ({
       ...filterFields,
+      and: { type: new GraphQLList(new GraphQLNonNull(FilterInput)) },
       or: { type: new GraphQLList(new GraphQLNonNull(FilterInput)) }
     })
   });
@@ -446,12 +459,13 @@ export function buildSchema(context: Context): GraphQLSchema {
 
     const ObjectType = new GraphQLObjectType({ name: typeName, fields: objectTypeFields });
 
-    // `fields` is a thunk so the `or` field can reference FilterInput itself —
+    // `fields` is a thunk so the `and`/`or` fields can reference FilterInput itself —
     // GraphQL input types may be self-referential as long as the fields are lazy.
     const FilterInput: GraphQLInputObjectType = new GraphQLInputObjectType({
       name: `${typeName}Filter`,
       fields: () => ({
         ...filterFields,
+        and: { type: new GraphQLList(new GraphQLNonNull(FilterInput)) },
         or: { type: new GraphQLList(new GraphQLNonNull(FilterInput)) }
       })
     });

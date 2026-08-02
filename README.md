@@ -54,7 +54,7 @@ const handler = new GraphQLHandler(ctx);
 
 const result = await handler.execute(`
   query {
-    users(filter: { name: "Alice" }, limit: 10) {
+    users(filter: { name: { eq: "Alice" } }, limit: 10) {
       id name email
     }
   }
@@ -143,7 +143,7 @@ type UserOrder {
 { userOrders { id name amount } }
 
 # Filter on a field from either table
-{ userOrders(filter: { name: "Alice" }) { name amount } }
+{ userOrders(filter: { name: { eq: "Alice" } }) { name amount } }
 
 # Order by a field from the right table
 { userOrders(orderBy: { field: "amount", direction: DESC }) { name amount } }
@@ -153,10 +153,14 @@ type UserOrder {
 
 # Count
 { userOrdersCount }
-{ userOrdersCount(filter: { name: "Alice" }) }
+{ userOrdersCount(filter: { name: { eq: "Alice" } }) }
 
 # Count + rows together
 { userOrdersList { count values { name amount } } }
+
+# count is the total matching row count, independent of limit/offset —
+# use it to compute total pages even when only fetching one page of rows
+{ userOrdersList(limit: 10, offset: 20) { count values { name amount } } }
 ```
 
 **Left join:**
@@ -188,12 +192,65 @@ For every queryset registered under name `Name`, the following types and query f
 | Generated | Description |
 |---|---|
 | `Name` | Object type with all exposed fields |
-| `NameFilter` | Input type for equality filtering |
+| `NameFilter` | Input type mapping each field to its `{Scalar}Filter` operator input, plus a self-referential `or` field |
+| `FloatFilter` / `IntFilter` | `{ eq, neq, gt, gte, lt, lte, in, notIn, between, isNull }` — numeric fields |
+| `StringFilter` | `{ eq, neq, like, in, notIn, isNull }` — string fields (no ordering, no `between`) |
+| `BooleanFilter` / `IDFilter` | `{ eq, neq, in, notIn, isNull }` — no ordering, no `like`, no `between` |
+| `{Scalar}Range` | Input type `{ from: Scalar!, to: Scalar! }` — the value type for `between` |
 | `NameOrderBy` | Input type `{ field: String!, direction: ASC \| DESC }` |
-| `NameList` | Result type `{ count: Int!, values: [Name!]! }` |
+| `NameList` | Result type `{ count: Int!, values: [Name!]! }` — `count` is the total row count matching `filter`, independent of `limit`/`offset` (it is not the number of rows in `values`) |
 | `names` | List query with `filter`, `orderBy`, `limit`, `offset` args |
 | `namesCount` | Count query with optional `filter` arg |
 | `namesList` | Combined count + list query |
+
+### Filtering
+
+Every filter field takes an operator object rather than a bare scalar. Multiple
+operators on the same field are ANDed together:
+
+```graphql
+{ users(filter: { name: { eq: "Alice" } }) { id name } }
+{ users(filter: { email: { like: "%@example.com" } }) { id name } }
+{ users(filter: { age: { gte: 18, lte: 65 } }) { id name } }
+```
+
+**Operators:**
+
+| Operator | Types | Value | Example |
+| --- | --- | --- | --- |
+| `eq`, `neq` | all | scalar | `{ status: { eq: "active" } }` |
+| `gt`, `gte`, `lt`, `lte` | numeric | scalar | `{ age: { gte: 18 } }` |
+| `like` | String | scalar | `{ email: { like: "%@example.com" } }` |
+| `in`, `notIn` | all | list of scalar | `{ status: { in: ["A", "B"] } }` |
+| `between` | numeric | `{ from, to }` | `{ age: { between: { from: 18, to: 65 } } }` |
+| `isNull` | all | Boolean flag | `{ email: { isNull: true } }` (use `isNull: false` for "is not null") |
+
+`notIn` composes `in(...)` with a `NOT (...)` wrapper; there's no dedicated `notIn`
+SQL builder method under the hood, but the GraphQL-facing operator works the same
+as a native one.
+
+**`or` — combining filters with OR:**
+
+Every `{Name}Filter` also accepts an `or` field: an array of nested filter objects
+(same shape, recursively). A filter object's own direct fields AND together; its
+`or` branches OR together; the two results AND:
+
+```graphql
+# name = "Alice" OR name = "Bob"
+{ users(filter: { or: [{ name: { eq: "Alice" } }, { name: { eq: "Bob" } }] }) { id name } }
+
+# email LIKE "%@example.com" AND (name = "Alice" OR name = "Bob")
+{ users(filter: {
+    email: { like: "%@example.com" }
+    or: [{ name: { eq: "Alice" } }, { name: { eq: "Bob" } }]
+  }) { id name } }
+
+# or branches can nest arbitrarily
+{ users(filter: { or: [
+    { name: { eq: "Alice" } },
+    { or: [{ name: { eq: "Bob" } }, { name: { eq: "Carol" } }] }
+  ] }) { id name } }
+```
 
 ## Introspection
 

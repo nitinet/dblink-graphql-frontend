@@ -1,16 +1,21 @@
 import { collection, exprBuilder } from 'dblink';
 import Context from 'dblink/src/Context.js';
 import FieldMapping from 'dblink/src/exprBuilder/FieldMapping.js';
+import Expression from 'dblink-core/src/sql/Expression.js';
 import { cloneDeep } from 'lodash-es';
 import {
+  GraphQLBoolean,
   GraphQLEnumType,
   GraphQLFieldConfigMap,
+  GraphQLFloat,
   GraphQLInputFieldConfigMap,
   GraphQLInputObjectType,
+  GraphQLInputType,
   GraphQLInt,
   GraphQLList,
   GraphQLNonNull,
   GraphQLObjectType,
+  GraphQLScalarType,
   GraphQLSchema,
   GraphQLString
 } from 'graphql';
@@ -68,6 +73,172 @@ const OrderDirectionEnum = new GraphQLEnumType({
   }
 });
 
+/** Operators offered on numeric-ish scalars that support ordering (Float, Int). */
+const NUMERIC_FILTER_OPS = ['eq', 'neq', 'gt', 'gte', 'lt', 'lte', 'in', 'notIn', 'between', 'isNull'] as const;
+/** Operators offered on String — adds pattern matching, keeps ordering out (not meaningful via GraphQL args here). */
+const STRING_FILTER_OPS = ['eq', 'neq', 'like', 'in', 'notIn', 'isNull'] as const;
+/** Operators offered on Boolean/ID — equality + membership + null-check only; no ordering, no `like`, no `between`. */
+const EQUALITY_ONLY_FILTER_OPS = ['eq', 'neq', 'in', 'notIn', 'isNull'] as const;
+
+type FilterOp = (typeof NUMERIC_FILTER_OPS)[number] | (typeof STRING_FILTER_OPS)[number] | (typeof EQUALITY_ONLY_FILTER_OPS)[number];
+
+/** Picks the operator set for a scalar type by identity against the well-known GraphQL scalars. */
+function filterOpsForType(gqlType: GraphQLScalarType): readonly FilterOp[] {
+  if (gqlType === GraphQLFloat || gqlType === GraphQLInt) return NUMERIC_FILTER_OPS;
+  if (gqlType === GraphQLString) return STRING_FILTER_OPS;
+  return EQUALITY_ONLY_FILTER_OPS; // GraphQLBoolean, GraphQLID
+}
+
+/**
+ * A literal boolean predicate (e.g. `1 = 1`) wrapped so it satisfies dblink's
+ * own `isValidExpression` guard (`exps.length > 0`), which a bare
+ * `new Expression(sql)` leaf would fail on its own — the guard would silently
+ * drop it if it were the only filter condition. `.and()` with itself is a
+ * no-op wrapper that gives it one child, not a real second predicate.
+ */
+function literalExpression(sql: string): Expression {
+  const leaf = new Expression(sql);
+  return leaf.and(leaf);
+}
+
+/**
+ * Builds the `Expression` for a single filter operator via a `WhereExprBuilder` method.
+ * `gte`/`lte` map to dblink's `gteq`/`lteq` methods; `notIn` composes `in(...).not()`
+ * since `WhereExprBuilder` has no direct `notIn`; `isNull` picks `isNull`/`isNotNull`
+ * based on the boolean flag value (it takes no operand); an empty `in`/`notIn` list is
+ * special-cased to the semantically correct literal (SQL's `IN ()` is invalid syntax,
+ * not "matches nothing"); every other operator name matches a `WhereExprBuilder` method
+ * directly.
+ */
+function buildOperandExpression<T extends AnyRecord>(eb: exprBuilder.WhereExprBuilder<T>, field: keyof T, op: FilterOp, value: unknown): Expression {
+  switch (op) {
+    case 'gte':
+      return eb.gteq(field, value as T[keyof T]);
+    case 'lte':
+      return eb.lteq(field, value as T[keyof T]);
+    case 'in': {
+      const list = value as T[keyof T][];
+      if (list.length === 0) return literalExpression('1 = 0'); // "in nothing" matches no rows
+      return eb.in(field, ...list);
+    }
+    case 'notIn': {
+      const list = value as T[keyof T][];
+      if (list.length === 0) return literalExpression('1 = 1'); // "not in nothing" matches every row
+      return eb.in(field, ...list).not();
+    }
+    case 'isNull':
+      return value ? eb.isNull(field) : eb.isNotNull(field);
+    case 'between': {
+      const { from, to } = value as { from: T[keyof T]; to: T[keyof T] };
+      return eb.between(field, from, to);
+    }
+    default:
+      return eb[op](field, value as T[keyof T]);
+  }
+}
+
+/** Per-scalar `{Scalar}Filter` input types, cached across every schema built in the process. */
+const sharedFilterTypeCache = new Map<GraphQLScalarType, GraphQLInputObjectType>();
+/** Per-scalar `{Scalar}Range` input types (used by `between`), cached the same way. */
+const sharedRangeTypeCache = new Map<GraphQLScalarType, GraphQLInputObjectType>();
+
+/**
+ * Returns the `{Scalar}Range` input type (`{ from, to }`) for a given scalar,
+ * building and caching it on first use. Backs the `between` operator.
+ */
+function getRangeInputType(gqlType: GraphQLScalarType): GraphQLInputObjectType {
+  const cached = sharedRangeTypeCache.get(gqlType);
+  if (cached) return cached;
+
+  const rangeInputType = new GraphQLInputObjectType({
+    name: `${gqlType.name}Range`,
+    fields: {
+      from: { type: new GraphQLNonNull(gqlType) },
+      to: { type: new GraphQLNonNull(gqlType) }
+    }
+  });
+  sharedRangeTypeCache.set(gqlType, rangeInputType);
+  return rangeInputType;
+}
+
+/**
+ * Picks the GraphQL input type for a single operator field within a `{Scalar}Filter`.
+ * `in`/`notIn` take a list of the scalar, `isNull` takes a bare `Boolean` flag,
+ * `between` takes a `{Scalar}Range` — every other operator takes the scalar itself.
+ */
+function filterOperandType(op: FilterOp, gqlType: GraphQLScalarType): GraphQLInputType {
+  switch (op) {
+    case 'in':
+    case 'notIn':
+      return new GraphQLList(new GraphQLNonNull(gqlType));
+    case 'isNull':
+      return GraphQLBoolean;
+    case 'between':
+      return getRangeInputType(gqlType);
+    default:
+      return gqlType;
+  }
+}
+
+/**
+ * Returns the `{Scalar}Filter` input type for a given scalar (e.g. `FloatFilter`,
+ * `StringFilter`), building and caching it on first use.
+ */
+function getFilterInputType(gqlType: GraphQLScalarType): GraphQLInputObjectType {
+  const cached = sharedFilterTypeCache.get(gqlType);
+  if (cached) return cached;
+
+  const ops = filterOpsForType(gqlType);
+  const fields: GraphQLInputFieldConfigMap = {};
+  for (const op of ops) {
+    fields[op] = { type: filterOperandType(op, gqlType) };
+  }
+
+  const filterInputType = new GraphQLInputObjectType({
+    name: `${gqlType.name}Filter`,
+    fields
+  });
+  sharedFilterTypeCache.set(gqlType, filterInputType);
+  return filterInputType;
+}
+
+/**
+ * Recursively builds a single `Expression` tree from a `{Name}Filter`-shaped object:
+ * every present field's operators AND together, and if an `or` array of nested
+ * filter objects is present, its branches OR together and AND with the rest.
+ * Returns `undefined` when the object contributes nothing (e.g. all-unknown fields).
+ */
+function buildFilterExpression<T extends AnyRecord>(eb: exprBuilder.WhereExprBuilder<T>, filter: AnyRecord, knownFields: Set<string>): Expression | undefined {
+  let combined: Expression | undefined;
+
+  for (const [field, opValue] of Object.entries(filter)) {
+    if (field === 'or') continue;
+    if (opValue === undefined || opValue === null) continue;
+    if (!knownFields.has(field)) continue;
+    const f = field as keyof T;
+    for (const [op, value] of Object.entries(opValue as AnyRecord)) {
+      if (value === undefined || value === null) continue;
+      const expr = buildOperandExpression(eb, f, op as FilterOp, value);
+      combined = combined ? combined.and(expr) : expr;
+    }
+  }
+
+  const orBranches = filter.or;
+  if (Array.isArray(orBranches) && orBranches.length > 0) {
+    let orCombined: Expression | undefined;
+    for (const branch of orBranches as AnyRecord[]) {
+      const branchExpr = buildFilterExpression(eb, branch, knownFields);
+      if (!branchExpr) continue;
+      orCombined = orCombined ? orCombined.or(branchExpr) : branchExpr;
+    }
+    if (orCombined) {
+      combined = combined ? combined.and(orCombined) : orCombined;
+    }
+  }
+
+  return combined;
+}
+
 export interface ListArgs {
   filter?: AnyRecord;
   orderBy?: { field: string; direction?: string };
@@ -78,16 +249,19 @@ export interface ListArgs {
 /**
  * Apply GraphQL query arguments (filter, orderBy, limit/offset) to a queryset.
  * Only fields in `knownFields` are accepted — unknown keys are silently ignored.
+ *
+ * Each filter field's value is an operator object (e.g. `{ gte: 2, lte: 6 }`);
+ * every operator present is ANDed together. An `or` array of nested filter
+ * objects (same shape, recursive) ORs its branches and ANDs the result with
+ * the rest of the filter.
  */
 export function applyArgs<T extends AnyRecord>(qs: collection.IQuerySet<T>, args: ListArgs, knownFields: Set<string>): collection.IQuerySet<T> {
   if (args.filter) {
-    for (const [field, value] of Object.entries(args.filter)) {
-      if (value === undefined || value === null) continue;
-      if (!knownFields.has(field)) continue;
-      const f = field as keyof T;
-      const v = value as T[keyof T];
-      qs = qs.where(eb => (eb as exprBuilder.WhereExprBuilder<T>).eq(f, v));
-    }
+    const filter = args.filter;
+    // qs.where() requires the callback to return an Expression (not undefined);
+    // an empty Expression has no sub-expressions, so dblink's own isValidExpression
+    // guard treats it as a no-op, matching "nothing to filter" behavior.
+    qs = qs.where(eb => buildFilterExpression(eb as exprBuilder.WhereExprBuilder<T>, filter, knownFields) ?? new Expression());
   }
 
   if (args.orderBy) {
@@ -169,14 +343,19 @@ export function buildSchemaFromQuerySet<T extends object>(queryset: collection.I
     knownFields.add(fn);
     const gqlType = jsTypeToGraphQL(mapping.dataType, mapping.primaryKey);
     objectTypeFields[fn] = { type: gqlType };
-    filterFields[fn] = { type: gqlType };
+    filterFields[fn] = { type: getFilterInputType(gqlType) };
   }
 
   const ObjectType = new GraphQLObjectType({ name, fields: objectTypeFields });
 
-  const FilterInput = new GraphQLInputObjectType({
+  // `fields` is a thunk so the `or` field can reference FilterInput itself —
+  // GraphQL input types may be self-referential as long as the fields are lazy.
+  const FilterInput: GraphQLInputObjectType = new GraphQLInputObjectType({
     name: `${name}Filter`,
-    fields: filterFields
+    fields: () => ({
+      ...filterFields,
+      or: { type: new GraphQLList(new GraphQLNonNull(FilterInput)) }
+    })
   });
 
   const OrderByInput = new GraphQLInputObjectType({
@@ -262,14 +441,19 @@ export function buildSchema(context: Context): GraphQLSchema {
     for (const [fieldName, mapping] of fieldMap.entries()) {
       const gqlType = jsTypeToGraphQL(mapping.dataType, mapping.primaryKey);
       objectTypeFields[fieldName] = { type: gqlType };
-      filterFields[fieldName] = { type: gqlType };
+      filterFields[fieldName] = { type: getFilterInputType(gqlType) };
     }
 
     const ObjectType = new GraphQLObjectType({ name: typeName, fields: objectTypeFields });
 
-    const FilterInput = new GraphQLInputObjectType({
+    // `fields` is a thunk so the `or` field can reference FilterInput itself —
+    // GraphQL input types may be self-referential as long as the fields are lazy.
+    const FilterInput: GraphQLInputObjectType = new GraphQLInputObjectType({
       name: `${typeName}Filter`,
-      fields: filterFields
+      fields: () => ({
+        ...filterFields,
+        or: { type: new GraphQLList(new GraphQLNonNull(FilterInput)) }
+      })
     });
 
     const OrderByInput = new GraphQLInputObjectType({

@@ -1,6 +1,6 @@
 {
   "name": "dblink-graphql-frontend",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "GraphQL execution layer for dblink — auto-generates schema from QuerySet metadata and supports introspection.",
   "license": "ISC",
   "author": "",
@@ -16,6 +16,7 @@
   },
   "dependencies": {
     "dblink": "^1.4.7",
+    "dblink-core": "^1.4.2",
     "graphql": "^17.0.2",
     "reflect-metadata": "^0.2.2",
     "lodash-es": "^4.18.1"

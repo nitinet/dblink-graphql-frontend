@@ -17,6 +17,10 @@ export interface FilterOperators<T> {
   notIn?: T[];
   between?: { from: T; to: T };
   isNull?: boolean;
+  /** Postgres array overlap (`&&`) - field shares at least one element with the operand. Only offered for array-typed fields. */
+  overlap?: T;
+  /** Postgres array contains (`@>`) - field includes every element of the operand. Only offered for array-typed fields. */
+  contains?: T;
 }
 
 /**

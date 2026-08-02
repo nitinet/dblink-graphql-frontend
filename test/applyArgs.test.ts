@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import Expression from 'dblink-core/src/sql/Expression.js';
 import { applyArgs, ListArgs } from '../src/schemaBuilder.js';
 
 /**
@@ -153,6 +154,32 @@ describe('applyArgs', () => {
     const qs = makeFakeQuerySet();
     applyArgs(qs as never, { filter: { amount: { between: { from: 10, to: 20 } } } } as ListArgs, new Set(['amount']));
     expect(qs.calls).toEqual([{ kind: 'where', method: 'between', field: 'amount', value: [10, 20] }]);
+  });
+
+  it('applies overlap by casting the operand into a Postgres array-literal Expression, not the raw list', () => {
+    const qs = makeFakeQuerySet();
+    applyArgs(qs as never, { filter: { tags: { overlap: ['vip', 'driver'] } } } as unknown as ListArgs, new Set(['tags']));
+    expect(qs.calls).toHaveLength(1);
+    const call = qs.calls[0] as { kind: 'where'; method: string; field: string; value: unknown };
+    expect(call.kind).toBe('where');
+    expect(call.method).toBe('overlap');
+    expect(call.field).toBe('tags');
+    // The raw JS array must not reach WhereExprBuilder directly - it has to be
+    // wrapped as a cast array-literal Expression (ARRAY[...]::varchar[]).
+    expect(call.value).toBeInstanceOf(Expression);
+    expect(call.value).not.toEqual(['vip', 'driver']);
+  });
+
+  it('applies contains by casting the operand into a Postgres array-literal Expression, not the raw list', () => {
+    const qs = makeFakeQuerySet();
+    applyArgs(qs as never, { filter: { tags: { contains: ['vip', 'driver'] } } } as unknown as ListArgs, new Set(['tags']));
+    expect(qs.calls).toHaveLength(1);
+    const call = qs.calls[0] as { kind: 'where'; method: string; field: string; value: unknown };
+    expect(call.kind).toBe('where');
+    expect(call.method).toBe('contains');
+    expect(call.field).toBe('tags');
+    expect(call.value).toBeInstanceOf(Expression);
+    expect(call.value).not.toEqual(['vip', 'driver']);
   });
 
   it('ORs branches of a top-level or array', () => {

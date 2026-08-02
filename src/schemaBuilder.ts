@@ -1,5 +1,6 @@
 import { collection, exprBuilder } from 'dblink';
 import Context from 'dblink/src/Context.js';
+import { array, cast } from 'dblink/src/expression/index.js';
 import FieldMapping from 'dblink/src/exprBuilder/FieldMapping.js';
 import Expression from 'dblink-core/src/sql/Expression.js';
 import { cloneDeep } from 'lodash-es';
@@ -19,7 +20,7 @@ import {
   GraphQLSchema,
   GraphQLString
 } from 'graphql';
-import { jsTypeToGraphQL } from './typeMapper.js';
+import { arrayElementGraphQLType, isArrayType, jsTypeToGraphQL } from './typeMapper.js';
 
 /** Generic record used for type-safe QuerySet chaining at runtime. */
 type AnyRecord = Record<string, unknown>;
@@ -37,7 +38,12 @@ type InternalQS<T extends object> = collection.IQuerySet<T> & {
   rightQuerySet?: InternalQS<object>;
   initColumnFieldMap(): void;
   context?: unknown;
+  /** Present on `TableSet`/`QuerySet` (not `JoinQuerySet`) - the entity class, needed to look up `@Type()` metadata for array element types. */
+  EntityType?: EntityCtor;
 };
+
+/** A dblink entity's constructor, matching `dblink-core`'s own `IEntityType<T>` shape. */
+type EntityCtor = new (...args: unknown[]) => unknown;
 
 /**
  * Returns true when the queryset is a JoinQuerySet (has left + right halves).
@@ -64,6 +70,29 @@ function getCombinedFieldMap<T extends object>(qs: InternalQS<T>): Map<string, F
   return qs.dbSet?.fieldMap ?? new Map<string, FieldMapping>();
 }
 
+/**
+ * Build a unified `fieldName → owning entity class` map, mirroring
+ * `getCombinedFieldMap`'s traversal - needed so an array field's `@Type()`
+ * metadata can be looked up against the *exact* entity class it was declared
+ * on (required by `class-transformer`'s `findTypeMetadata(target, propertyName)`),
+ * even when the field came from one side of a `JoinQuerySet`.
+ */
+function getCombinedEntityTypeMap<T extends object>(qs: InternalQS<T>): Map<string, EntityCtor> {
+  if (isJoinQuerySet(qs) && qs.leftQuerySet && qs.rightQuerySet) {
+    const combined = new Map<string, EntityCtor>();
+    getCombinedEntityTypeMap(qs.leftQuerySet).forEach((entityType, fieldName) => combined.set(fieldName, entityType));
+    getCombinedEntityTypeMap(qs.rightQuerySet).forEach((entityType, fieldName) => combined.set(fieldName, entityType));
+    return combined;
+  }
+  const combined = new Map<string, EntityCtor>();
+  if (qs.EntityType) {
+    for (const fieldName of (qs.dbSet?.fieldMap ?? new Map<string, FieldMapping>()).keys()) {
+      combined.set(fieldName, qs.EntityType);
+    }
+  }
+  return combined;
+}
+
 /** Shared enum for sort direction — one instance shared across all schemas. */
 const OrderDirectionEnum = new GraphQLEnumType({
   name: 'OrderDirection',
@@ -79,11 +108,18 @@ const NUMERIC_FILTER_OPS = ['eq', 'neq', 'gt', 'gte', 'lt', 'lte', 'in', 'notIn'
 const STRING_FILTER_OPS = ['eq', 'neq', 'like', 'in', 'notIn', 'isNull'] as const;
 /** Operators offered on Boolean/ID — equality + membership + null-check only; no ordering, no `like`, no `between`. */
 const EQUALITY_ONLY_FILTER_OPS = ['eq', 'neq', 'in', 'notIn', 'isNull'] as const;
+/** Operators offered on array-typed fields (e.g. a Postgres `varchar[]` column) — no scalar comparison ops apply. */
+const ARRAY_FILTER_OPS = ['overlap', 'contains', 'isNull'] as const;
 
-type FilterOp = (typeof NUMERIC_FILTER_OPS)[number] | (typeof STRING_FILTER_OPS)[number] | (typeof EQUALITY_ONLY_FILTER_OPS)[number];
+type FilterOp = (typeof NUMERIC_FILTER_OPS)[number] | (typeof STRING_FILTER_OPS)[number] | (typeof EQUALITY_ONLY_FILTER_OPS)[number] | (typeof ARRAY_FILTER_OPS)[number];
 
-/** Picks the operator set for a scalar type by identity against the well-known GraphQL scalars. */
-function filterOpsForType(gqlType: GraphQLScalarType): readonly FilterOp[] {
+/**
+ * Picks the operator set for a field. Array-typed fields (see `isArrayType`) always
+ * get `ARRAY_FILTER_OPS` regardless of their element scalar; everything else is
+ * picked by identity against the well-known GraphQL scalars.
+ */
+function filterOpsForType(gqlType: GraphQLScalarType, isArray: boolean): readonly FilterOp[] {
+  if (isArray) return ARRAY_FILTER_OPS;
   if (gqlType === GraphQLFloat || gqlType === GraphQLInt) return NUMERIC_FILTER_OPS;
   if (gqlType === GraphQLString) return STRING_FILTER_OPS;
   return EQUALITY_ONLY_FILTER_OPS; // GraphQLBoolean, GraphQLID
@@ -102,15 +138,47 @@ function literalExpression(sql: string): Expression {
 }
 
 /**
+ * Postgres array-literal cast type for a given element scalar - `overlap`'s operand
+ * must be cast to the same array type as the column itself (`text[]`/`numeric[]`/
+ * `boolean[]`), not always `varchar[]`, once the element type is actually known
+ * (see `arrayElementGraphQLType`).
+ */
+function postgresArrayCastType(elementType: GraphQLScalarType): string {
+  if (elementType === GraphQLFloat) return 'numeric[]';
+  if (elementType === GraphQLBoolean) return 'boolean[]';
+  return 'varchar[]';
+}
+
+/**
+ * Wraps a filter operator's array-valued operand as a cast Postgres array literal
+ * (`ARRAY[...]::{castType}`) via dblink's `array`/`cast` expression helpers. Array
+ * columns must be compared against a literal of array type on the wire — unlike
+ * scalar `in`/`notIn`, a bare parameterized list won't do here.
+ */
+function arrayOperand(value: unknown, castType: string): Expression {
+  return cast(array(...(value as unknown[])), castType);
+}
+
+/**
  * Builds the `Expression` for a single filter operator via a `WhereExprBuilder` method.
  * `gte`/`lte` map to dblink's `gteq`/`lteq` methods; `notIn` composes `in(...).not()`
  * since `WhereExprBuilder` has no direct `notIn`; `isNull` picks `isNull`/`isNotNull`
  * based on the boolean flag value (it takes no operand); an empty `in`/`notIn` list is
  * special-cased to the semantically correct literal (SQL's `IN ()` is invalid syntax,
- * not "matches nothing"); every other operator name matches a `WhereExprBuilder` method
- * directly.
+ * not "matches nothing"); `overlap` casts its operand to a Postgres array literal via
+ * `arrayOperand` — an empty array needs no such special-casing since Postgres's `&&`
+ * already returns false against an empty array (the correct "overlaps with nothing"
+ * answer) and `@>` already returns true against an empty array (every array vacuously
+ * contains the empty set); every other operator name matches a `WhereExprBuilder`
+ * method directly.
  */
-function buildOperandExpression<T extends AnyRecord>(eb: exprBuilder.WhereExprBuilder<T>, field: keyof T, op: FilterOp, value: unknown): Expression {
+function buildOperandExpression<T extends AnyRecord>(
+  eb: exprBuilder.WhereExprBuilder<T>,
+  field: keyof T,
+  op: FilterOp,
+  value: unknown,
+  arrayElementTypeMap?: Map<string, GraphQLScalarType>
+): Expression {
   switch (op) {
     case 'gte':
       return eb.gteq(field, value as T[keyof T]);
@@ -132,13 +200,26 @@ function buildOperandExpression<T extends AnyRecord>(eb: exprBuilder.WhereExprBu
       const { from, to } = value as { from: T[keyof T]; to: T[keyof T] };
       return eb.between(field, from, to);
     }
+    case 'overlap': {
+      const elementType = arrayElementTypeMap?.get(field as string) ?? GraphQLString;
+      return eb.overlap(field, arrayOperand(value, postgresArrayCastType(elementType)));
+    }
+    case 'contains': {
+      const elementType = arrayElementTypeMap?.get(field as string) ?? GraphQLString;
+      return eb.contains(field, arrayOperand(value, postgresArrayCastType(elementType)));
+    }
     default:
       return eb[op](field, value as T[keyof T]);
   }
 }
 
-/** Per-scalar `{Scalar}Filter` input types, cached across every schema built in the process. */
-const sharedFilterTypeCache = new Map<GraphQLScalarType, GraphQLInputObjectType>();
+/**
+ * Per-scalar `{Scalar}Filter` input types, cached across every schema built in the
+ * process. Keyed by scalar name plus array-ness so e.g. a plain `String` field and
+ * an array-typed `String` field get distinct cached types (`StringFilter` vs
+ * `StringArrayFilter`) instead of colliding on the same GraphQL type name.
+ */
+const sharedFilterTypeCache = new Map<string, GraphQLInputObjectType>();
 /** Per-scalar `{Scalar}Range` input types (used by `between`), cached the same way. */
 const sharedRangeTypeCache = new Map<GraphQLScalarType, GraphQLInputObjectType>();
 
@@ -170,6 +251,8 @@ function filterOperandType(op: FilterOp, gqlType: GraphQLScalarType): GraphQLInp
   switch (op) {
     case 'in':
     case 'notIn':
+    case 'overlap':
+    case 'contains':
       return new GraphQLList(new GraphQLNonNull(gqlType));
     case 'isNull':
       return GraphQLBoolean;
@@ -181,24 +264,26 @@ function filterOperandType(op: FilterOp, gqlType: GraphQLScalarType): GraphQLInp
 }
 
 /**
- * Returns the `{Scalar}Filter` input type for a given scalar (e.g. `FloatFilter`,
- * `StringFilter`), building and caching it on first use.
+ * Returns the `{Scalar}Filter` (or `{Scalar}ArrayFilter` for an array-typed field)
+ * input type for a given scalar (e.g. `FloatFilter`, `StringFilter`,
+ * `StringArrayFilter`), building and caching it on first use.
  */
-function getFilterInputType(gqlType: GraphQLScalarType): GraphQLInputObjectType {
-  const cached = sharedFilterTypeCache.get(gqlType);
+function getFilterInputType(gqlType: GraphQLScalarType, isArray: boolean): GraphQLInputObjectType {
+  const cacheKey = isArray ? `${gqlType.name}Array` : gqlType.name;
+  const cached = sharedFilterTypeCache.get(cacheKey);
   if (cached) return cached;
 
-  const ops = filterOpsForType(gqlType);
+  const ops = filterOpsForType(gqlType, isArray);
   const fields: GraphQLInputFieldConfigMap = {};
   for (const op of ops) {
     fields[op] = { type: filterOperandType(op, gqlType) };
   }
 
   const filterInputType = new GraphQLInputObjectType({
-    name: `${gqlType.name}Filter`,
+    name: `${cacheKey}Filter`,
     fields
   });
-  sharedFilterTypeCache.set(gqlType, filterInputType);
+  sharedFilterTypeCache.set(cacheKey, filterInputType);
   return filterInputType;
 }
 
@@ -210,7 +295,12 @@ function getFilterInputType(gqlType: GraphQLScalarType): GraphQLInputObjectType 
  * an `or` array of nested filter objects ORs its branches and ANDs the result with the rest.
  * Returns `undefined` when the object contributes nothing (e.g. all-unknown fields).
  */
-function buildFilterExpression<T extends AnyRecord>(eb: exprBuilder.WhereExprBuilder<T>, filter: AnyRecord, knownFields: Set<string>): Expression | undefined {
+function buildFilterExpression<T extends AnyRecord>(
+  eb: exprBuilder.WhereExprBuilder<T>,
+  filter: AnyRecord,
+  knownFields: Set<string>,
+  arrayElementTypeMap?: Map<string, GraphQLScalarType>
+): Expression | undefined {
   let combined: Expression | undefined;
 
   for (const [field, opValue] of Object.entries(filter)) {
@@ -220,7 +310,7 @@ function buildFilterExpression<T extends AnyRecord>(eb: exprBuilder.WhereExprBui
     const f = field as keyof T;
     for (const [op, value] of Object.entries(opValue as AnyRecord)) {
       if (value === undefined || value === null) continue;
-      const expr = buildOperandExpression(eb, f, op as FilterOp, value);
+      const expr = buildOperandExpression(eb, f, op as FilterOp, value, arrayElementTypeMap);
       combined = combined ? combined.and(expr) : expr;
     }
   }
@@ -228,7 +318,7 @@ function buildFilterExpression<T extends AnyRecord>(eb: exprBuilder.WhereExprBui
   const andBranches = filter.and;
   if (Array.isArray(andBranches) && andBranches.length > 0) {
     for (const branch of andBranches as AnyRecord[]) {
-      const branchExpr = buildFilterExpression(eb, branch, knownFields);
+      const branchExpr = buildFilterExpression(eb, branch, knownFields, arrayElementTypeMap);
       if (!branchExpr) continue;
       combined = combined ? combined.and(branchExpr) : branchExpr;
     }
@@ -238,7 +328,7 @@ function buildFilterExpression<T extends AnyRecord>(eb: exprBuilder.WhereExprBui
   if (Array.isArray(orBranches) && orBranches.length > 0) {
     let orCombined: Expression | undefined;
     for (const branch of orBranches as AnyRecord[]) {
-      const branchExpr = buildFilterExpression(eb, branch, knownFields);
+      const branchExpr = buildFilterExpression(eb, branch, knownFields, arrayElementTypeMap);
       if (!branchExpr) continue;
       orCombined = orCombined ? orCombined.or(branchExpr) : branchExpr;
     }
@@ -267,13 +357,13 @@ export interface ListArgs {
  * fields unless combined with multiple independent `or` groups. An `or` array
  * ORs its branches and ANDs the result with the rest of the filter.
  */
-export function applyArgs<T extends AnyRecord>(qs: collection.IQuerySet<T>, args: ListArgs, knownFields: Set<string>): collection.IQuerySet<T> {
+export function applyArgs<T extends AnyRecord>(qs: collection.IQuerySet<T>, args: ListArgs, knownFields: Set<string>, arrayElementTypeMap?: Map<string, GraphQLScalarType>): collection.IQuerySet<T> {
   if (args.filter) {
     const filter = args.filter;
     // qs.where() requires the callback to return an Expression (not undefined);
     // an empty Expression has no sub-expressions, so dblink's own isValidExpression
     // guard treats it as a no-op, matching "nothing to filter" behavior.
-    qs = qs.where(eb => buildFilterExpression(eb as exprBuilder.WhereExprBuilder<T>, filter, knownFields) ?? new Expression());
+    qs = qs.where(eb => buildFilterExpression(eb as exprBuilder.WhereExprBuilder<T>, filter, knownFields, arrayElementTypeMap) ?? new Expression());
   }
 
   if (args.orderBy) {
@@ -338,6 +428,7 @@ export function buildSchemaFromQuerySet<T extends object>(queryset: collection.I
 
   const { columnFieldMap } = qs; // colName (or alias_colName for joins) → fieldName
   const fieldMap = getCombinedFieldMap(qs); // fieldName → FieldMapping (dataType, primaryKey)
+  const entityTypeMap = getCombinedEntityTypeMap(qs); // fieldName → owning entity class (for array element @Type() lookup)
 
   if (columnFieldMap.size === 0) {
     throw new Error(`buildSchemaFromQuerySet: queryset for "${name}" has no mapped fields.`);
@@ -346,6 +437,7 @@ export function buildSchemaFromQuerySet<T extends object>(queryset: collection.I
   const knownFields = new Set<string>();
   const objectTypeFields: GraphQLFieldConfigMap<unknown, unknown> = {};
   const filterFields: GraphQLInputFieldConfigMap = {};
+  const arrayElementTypeMap = new Map<string, GraphQLScalarType>();
 
   for (const fieldName of columnFieldMap.values()) {
     const mapping = fieldMap.get(fieldName as string);
@@ -353,9 +445,11 @@ export function buildSchemaFromQuerySet<T extends object>(queryset: collection.I
 
     const fn = fieldName as string;
     knownFields.add(fn);
-    const gqlType = jsTypeToGraphQL(mapping.dataType, mapping.primaryKey);
-    objectTypeFields[fn] = { type: gqlType };
-    filterFields[fn] = { type: getFilterInputType(gqlType) };
+    const isArray = isArrayType(mapping.dataType, mapping.primaryKey);
+    const gqlType = isArray ? arrayElementGraphQLType(entityTypeMap.get(fn), fn) : jsTypeToGraphQL(mapping.dataType, mapping.primaryKey);
+    if (isArray) arrayElementTypeMap.set(fn, gqlType);
+    objectTypeFields[fn] = { type: isArray ? new GraphQLList(gqlType) : gqlType };
+    filterFields[fn] = { type: getFilterInputType(gqlType, isArray) };
   }
 
   const ObjectType = new GraphQLObjectType({ name, fields: objectTypeFields });
@@ -395,7 +489,7 @@ export function buildSchemaFromQuerySet<T extends object>(queryset: collection.I
   };
 
   function resolveQS(args: ListArgs): collection.IQuerySet<AnyRecord> {
-    return applyArgs(freshQuerySet(queryset) as unknown as collection.IQuerySet<AnyRecord>, args, knownFields);
+    return applyArgs(freshQuerySet(queryset) as unknown as collection.IQuerySet<AnyRecord>, args, knownFields, arrayElementTypeMap);
   }
 
   const queryName = name.charAt(0).toLowerCase() + name.slice(1) + 's';
@@ -450,11 +544,14 @@ export function buildSchema(context: Context): GraphQLSchema {
 
     const objectTypeFields: GraphQLFieldConfigMap<unknown, unknown> = {};
     const filterFields: GraphQLInputFieldConfigMap = {};
+    const arrayElementTypeMap = new Map<string, GraphQLScalarType>();
 
     for (const [fieldName, mapping] of fieldMap.entries()) {
-      const gqlType = jsTypeToGraphQL(mapping.dataType, mapping.primaryKey);
-      objectTypeFields[fieldName] = { type: gqlType };
-      filterFields[fieldName] = { type: getFilterInputType(gqlType) };
+      const isArray = isArrayType(mapping.dataType, mapping.primaryKey);
+      const gqlType = isArray ? arrayElementGraphQLType(EntityType, fieldName) : jsTypeToGraphQL(mapping.dataType, mapping.primaryKey);
+      if (isArray) arrayElementTypeMap.set(fieldName, gqlType);
+      objectTypeFields[fieldName] = { type: isArray ? new GraphQLList(gqlType) : gqlType };
+      filterFields[fieldName] = { type: getFilterInputType(gqlType, isArray) };
     }
 
     const ObjectType = new GraphQLObjectType({ name: typeName, fields: objectTypeFields });
@@ -499,7 +596,7 @@ export function buildSchema(context: Context): GraphQLSchema {
       type: new GraphQLNonNull(new GraphQLList(new GraphQLNonNull(ObjectType))),
       args: listArgs,
       resolve(_root, args) {
-        return applyArgs(tableSet, args as ListArgs, knownFields).list();
+        return applyArgs(tableSet, args as ListArgs, knownFields, arrayElementTypeMap).list();
       }
     };
 
@@ -507,7 +604,7 @@ export function buildSchema(context: Context): GraphQLSchema {
       type: new GraphQLNonNull(GraphQLInt),
       args: { filter: { type: FilterInput } },
       resolve(_root, args) {
-        return applyArgs(tableSet, args as ListArgs, knownFields).count();
+        return applyArgs(tableSet, args as ListArgs, knownFields, arrayElementTypeMap).count();
       }
     };
 
@@ -515,7 +612,7 @@ export function buildSchema(context: Context): GraphQLSchema {
       type: new GraphQLNonNull(ListResultType),
       args: listArgs,
       resolve(_root, args) {
-        return applyArgs(tableSet, args as ListArgs, knownFields).listAndCount();
+        return applyArgs(tableSet, args as ListArgs, knownFields, arrayElementTypeMap).listAndCount();
       }
     };
   }
